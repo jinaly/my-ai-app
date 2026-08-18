@@ -1,0 +1,19 @@
+{
+  "name": "my-ai-app",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "dev:ai": "cd ai-service && source venv/bin/activate && uvicorn app.main:app --reload --port 8000",
+    "dev": "concurrently -n \"CLIENT,SERVER,AI\" -c \"blue,green,magenta\" \"npm run dev:client\" \"npm run dev:server\" \"npm run dev:ai\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}
