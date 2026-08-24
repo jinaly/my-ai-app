@@ -14,23 +14,26 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "server-gateway" });
 });
 
+// Add or update this route in server/src/index.js
 app.post("/api/chat", async (req, res) => {
-  const { prompt } = req.body;
+  const { messages, prompt } = req.body;
 
-  if (!prompt) {
-    return res.status(400).json({ error: "Prompt is required" });
-  }
+  // Handles both full conversation array and legacy single prompt
+  const payloadMessages = messages || [{ role: "user", content: prompt }];
 
   try {
-    const aiResponse = await axios.post(`${AI_SERVICE_URL}/api/generate`, {
-      prompt,
+    const aiResponse = await axios.post(`${AI_SERVICE_URL}/api/chat`, {
+      messages: payloadMessages,
     });
 
     res.json({ data: aiResponse.data.response });
   } catch (error) {
-    console.error("AI Service Error:", error.response?.data || error.message);
+    console.error(
+      "AI Service Gateway Error:",
+      error.response?.data || error.message
+    );
     res.status(500).json({
-      error: "Failed to process AI query",
+      error: "Failed to process AI chat query",
       details: error.response?.data || error.message,
     });
   }

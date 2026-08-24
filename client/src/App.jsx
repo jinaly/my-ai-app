@@ -1,32 +1,58 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 
-function App() {
-  const [prompt, setPrompt] = useState("");
-  const [response, setResponse] = useState("");
+export default function App() {
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hello! How can I help you today?" },
+  ]);
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  // Auto-scroll to latest message
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, loading]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!prompt.trim()) return;
+    if (!input.trim() || loading) return;
 
+    // 1. Append user message to local state
+    const userMessage = { role: "user", content: input.trim() };
+    const updatedMessages = [...messages, userMessage];
+
+    setMessages(updatedMessages);
+    setInput("");
     setLoading(true);
-    setResponse("");
 
     try {
+      // 2. Send the ENTIRE message history to Express gateway
       const res = await fetch("http://localhost:5001/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ messages: updatedMessages }),
       });
 
       const data = await res.json();
+
       if (data.data) {
-        setResponse(data.data);
+        // 3. Append assistant response to state
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: data.data },
+        ]);
       } else {
-        setResponse("Error: " + (data.error || "Something went wrong"));
+        throw new Error(data.error || "No response from server");
       }
     } catch (err) {
-      setResponse("Connection error: " + err.message);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `⚠️ Error: ${err.message}` },
+      ]);
     } finally {
       setLoading(false);
     }
@@ -35,31 +61,87 @@ function App() {
   return (
     <div
       style={{
-        maxWidth: "700px",
+        maxWidth: "680px",
         margin: "40px auto",
-        fontFamily: "sans-serif",
-        padding: "20px",
+        fontFamily: "system-ui, sans-serif",
       }}
     >
-      <h2>GenAI Full-Stack Starter</h2>
-      <p style={{ color: "#666" }}>
-        React &rarr; Express Gateway &rarr; FastAPI (LangGraph)
-      </p>
+      <h2 style={{ marginBottom: "16px", color: "#0f172a" }}>
+        AI Chat Assistant
+      </h2>
 
+      {/* Chat Window */}
+      <div
+        style={{
+          border: "1px solid #e2e8f0",
+          borderRadius: "10px",
+          height: "480px",
+          overflowY: "auto",
+          padding: "16px",
+          backgroundColor: "#f8fafc",
+        }}
+      >
+        {messages.map((msg, idx) => {
+          const isUser = msg.role === "user";
+          return (
+            <div
+              key={idx}
+              style={{
+                display: "flex",
+                justifyContent: isUser ? "flex-end" : "flex-start",
+                marginBottom: "12px",
+              }}
+            >
+              <div
+                style={{
+                  maxWidth: "75%",
+                  padding: "10px 14px",
+                  borderRadius: "12px",
+                  background: isUser ? "#2563eb" : "#ffffff",
+                  color: isUser ? "#ffffff" : "#0f172a",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
+                  whiteSpace: "pre-wrap",
+                  lineHeight: "1.5",
+                }}
+              >
+                {msg.content}
+              </div>
+            </div>
+          );
+        })}
+
+        {loading && (
+          <div
+            style={{
+              color: "#64748b",
+              fontStyle: "italic",
+              fontSize: "14px",
+              marginTop: "8px",
+            }}
+          >
+            AI is thinking...
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input Form */}
       <form
         onSubmit={handleSubmit}
-        style={{ display: "flex", gap: "10px", marginTop: "20px" }}
+        style={{ display: "flex", marginTop: "12px", gap: "8px" }}
       >
         <input
           type="text"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Ask something..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask a question..."
           style={{
             flex: 1,
-            padding: "10px",
+            padding: "10px 14px",
             borderRadius: "6px",
-            border: "1px solid #ccc",
+            border: "1px solid #cbd5e1",
+            outline: "none",
+            fontSize: "15px",
           }}
         />
         <button
@@ -68,32 +150,16 @@ function App() {
           style={{
             padding: "10px 20px",
             borderRadius: "6px",
-            background: "#0070f3",
-            color: "#fff",
             border: "none",
-            cursor: "pointer",
+            backgroundColor: "#2563eb",
+            color: "#ffffff",
+            fontWeight: "500",
+            cursor: loading ? "not-allowed" : "pointer",
           }}
         >
-          {loading ? "Thinking..." : "Send"}
+          Send
         </button>
       </form>
-
-      {response && (
-        <div
-          style={{
-            marginTop: "25px",
-            padding: "15px",
-            background: "#f5f5f5",
-            borderRadius: "8px",
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          <strong>Response:</strong>
-          <p>{response}</p>
-        </div>
-      )}
     </div>
   );
 }
-
-export default App;

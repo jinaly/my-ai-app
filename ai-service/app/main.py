@@ -1,7 +1,7 @@
 import os
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TypedDict
+from typing import Annotated, List
+from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
@@ -9,20 +9,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-APP_DIR = Path(__file__).resolve().parent         
-SERVICE_DIR = APP_DIR.parent                     
-MONOREPO_ROOT = SERVICE_DIR.parent                
 
-for env_candidate in [
-    SERVICE_DIR / ".env",
-    MONOREPO_ROOT / ".env",
-    APP_DIR / ".env",
-    Path(".env").resolve(),
-]:
-    if env_candidate.is_file():
-        load_dotenv(dotenv_path=env_candidate, override=True)
+APP_DIR = Path(__file__).resolve().parent
+ROOT_DIR = APP_DIR.parent.parent
+
+for candidate in [ROOT_DIR / ".env", APP_DIR.parent / ".env", APP_DIR / ".env"]:
+    if candidate.is_file():
+        load_dotenv(dotenv_path=candidate, override=True)
         break
 else:
     load_dotenv()
@@ -31,53 +27,56 @@ API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 MODEL_ID = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 if not API_KEY:
-    raise RuntimeError(
-        f"Missing API key! Checked paths including {MONOREPO_ROOT / '.env'}"
-    )
+    raise RuntimeError("Missing GOOGLE_API_KEY in environment.")
 
 client = genai.Client(api_key=API_KEY)
 
-class AgentState(TypedDict):
-    input_text: str
-    response_text: str
+
+class ChatState(TypedDict):
+    messages: Annotated[List[dict], add_messages]
 
 
-def generate_node(state: AgentState) -> AgentState:
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=state["input_text"],
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                system_instruction="You are a senior AI assistant delivering concise, accurate, production-grade solutions.",
-            ),
+def extract_message_info(msg):
+    if hasattr(msg, "content"):
+        content = msg.content
+        role = "assistant" if msg.__class__.__name__.startswith("AI") else "user"
+        return role, content
+    return msg.get("role", "user"), msg.get("content", "")
+
+
+def chat_node(state: ChatState) -> ChatState:
+    formatted_contents = []
+    
+    for msg in state["messages"]:
+        role, content = extract_message_info(msg)
+        sdk_role = "user" if role == "user" else "model"
+        formatted_contents.append(
+            types.Content(
+                role=sdk_role,
+                parts=[types.Part.from_text(text=str(content))],
+            )
         )
-        return {"response_text": response.text or ""}
-    except Exception as exc:
-        raise RuntimeError(f"LLM Generation failed: {str(exc)}") from exc
+
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=formatted_contents,
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            system_instruction="You are a helpful AI engineering assistant.",
+        ),
+    )
+
+    ai_reply = {"role": "assistant", "content": response.text or ""}
+    return {"messages": [ai_reply]}
 
 
-def build_graph():
-    builder = StateGraph(AgentState)
-    builder.add_node("generate", generate_node)
-    builder.set_entry_point("generate")
-    builder.add_edge("generate", END)
-    return builder.compile()
+builder = StateGraph(ChatState)
+builder.add_node("chat", chat_node)
+builder.set_entry_point("chat")
+builder.add_edge("chat", END)
+chat_executor = builder.compile()
 
-
-agent_executor = build_graph()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print(f"🚀 [AI-Service] Bootstrapping with Gemini ({MODEL_ID})...")
-    yield
-
-
-app = FastAPI(
-    title="AI Orchestration Service",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="AI Service Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,37 +87,39 @@ app.add_middleware(
 )
 
 
-class QueryRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, max_length=10000, description="User prompt")
+class MessageItem(BaseModel):
+    role: str = Field(..., description="'user' or 'assistant'")
+    content: str = Field(..., min_length=1)
 
 
-class QueryResponse(BaseModel):
+class ChatRequest(BaseModel):
+    messages: List[MessageItem]
+
+
+class ChatResponse(BaseModel):
     response: str
-    model: str = MODEL_ID
 
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "service": "ai-service",
-        "sdk": "google-genai",
-        "model": MODEL_ID,
-    }
+    return {"status": "healthy", "service": "ai-service", "memory": True}
 
 
-@app.post("/api/generate", response_model=QueryResponse, status_code=status.HTTP_200_OK)
-async def generate_response(payload: QueryRequest):
+@app.post("/api/chat", response_model=ChatResponse)
+async def handle_chat(payload: ChatRequest):
     try:
-        result = agent_executor.invoke({"input_text": payload.prompt})
-        return QueryResponse(response=result["response_text"])
-    except RuntimeError as r_err:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(r_err),
-        )
+        initial_state = {
+            "messages": [msg.model_dump() for msg in payload.messages]
+        }
+        result = chat_executor.invoke(initial_state)
+
+        last_msg = result["messages"][-1]
+        _, text_content = extract_message_info(last_msg)
+
+        return ChatResponse(response=text_content)
     except Exception as exc:
+        print("❌ LangGraph Error:", str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal pipeline failure: {str(exc)}",
+            detail=f"LangGraph execution failed: {str(exc)}",
         )
