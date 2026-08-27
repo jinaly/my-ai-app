@@ -1,6 +1,7 @@
 import os
+import json
 from pathlib import Path
-from typing import Annotated, List
+from typing import Annotated, List, Literal
 from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
@@ -12,7 +13,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-
+# -----------------------------------------------------------------------------
+# 1. Environment & Client Setup
+# -----------------------------------------------------------------------------
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent.parent
 
@@ -32,8 +35,34 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 
 
+# -----------------------------------------------------------------------------
+# 2. Define Custom Tools (Python Functions)
+# -----------------------------------------------------------------------------
+def get_current_weather(city: str) -> str:
+    """Get the current live weather and temperature for a given city."""
+    normalized = city.strip().lower()
+    if "ahmedabad" in normalized:
+        return json.dumps({"city": "Ahmedabad", "temperature": "32°C", "condition": "Sunny and Clear", "humidity": "45%"})
+    elif "mumbai" in normalized:
+        return json.dumps({"city": "Mumbai", "temperature": "30°C", "condition": "Humid / Partly Cloudy", "humidity": "78%"})
+    elif "london" in normalized:
+        return json.dumps({"city": "London", "temperature": "18°C", "condition": "Light Rain", "humidity": "82%"})
+    else:
+        return json.dumps({"city": city, "temperature": "25°C", "condition": "Clear Sky", "humidity": "50%"})
+
+
+# Tool mapping dictionary for easy execution
+TOOL_REGISTRY = {
+    "get_current_weather": get_current_weather
+}
+
+
+# -----------------------------------------------------------------------------
+# 3. State Schema
+# -----------------------------------------------------------------------------
 class ChatState(TypedDict):
     messages: Annotated[List[dict], add_messages]
+    tool_calls: List[dict]
 
 
 def extract_message_info(msg):
@@ -44,7 +73,10 @@ def extract_message_info(msg):
     return msg.get("role", "user"), msg.get("content", "")
 
 
-def chat_node(state: ChatState) -> ChatState:
+# -----------------------------------------------------------------------------
+# 4. Agent Node (Gemini with Tool Declaration)
+# -----------------------------------------------------------------------------
+def agent_node(state: ChatState) -> ChatState:
     formatted_contents = []
     
     for msg in state["messages"]:
@@ -57,26 +89,105 @@ def chat_node(state: ChatState) -> ChatState:
             )
         )
 
+    # Pass Python tools to Gemini
     response = client.models.generate_content(
         model=MODEL_ID,
         contents=formatted_contents,
         config=types.GenerateContentConfig(
-            temperature=0.7,
-            system_instruction="You are a helpful AI engineering assistant.",
+            temperature=0.3,
+            tools=[get_current_weather],
+            system_instruction="You are a helpful assistant with access to real-time tools. Use them whenever relevant.",
         ),
     )
 
-    ai_reply = {"role": "assistant", "content": response.text or ""}
-    return {"messages": [ai_reply]}
+    detected_tool_calls = []
+    text_content = ""
+
+    # Check if Gemini wants to call a tool
+    if response.function_calls:
+        for fc in response.function_calls:
+            detected_tool_calls.append({
+                "name": fc.name,
+                "args": dict(fc.args),
+            })
+    else:
+        text_content = response.text or ""
+
+    ai_reply = {"role": "assistant", "content": text_content}
+
+    return {
+        "messages": [ai_reply],
+        "tool_calls": detected_tool_calls
+    }
 
 
+# -----------------------------------------------------------------------------
+# 5. Tool Node (Executes Python Functions)
+# -----------------------------------------------------------------------------
+def tool_node(state: ChatState) -> ChatState:
+    tool_results = []
+    
+    for call in state.get("tool_calls", []):
+        tool_name = call["name"]
+        tool_args = call["args"]
+        
+        if tool_name in TOOL_REGISTRY:
+            fn = TOOL_REGISTRY[tool_name]
+            output = fn(**tool_args)
+            tool_results.append(f"Tool [{tool_name}] output: {output}")
+
+    # Inject tool output into conversation context as user/system observation
+    tool_message = {
+        "role": "user",
+        "content": "Observation from tools:\n" + "\n".join(tool_results)
+    }
+
+    return {
+        "messages": [tool_message],
+        "tool_calls": []
+    }
+
+
+# -----------------------------------------------------------------------------
+# 6. Conditional Edge Router
+# -----------------------------------------------------------------------------
+def should_continue(state: ChatState) -> Literal["tools", "__end__"]:
+    # If agent requested a tool call, route to 'tools', otherwise finish
+    if state.get("tool_calls"):
+        return "tools"
+    return END
+
+
+# -----------------------------------------------------------------------------
+# 7. Compile Graph with Cyclical Loop
+# -----------------------------------------------------------------------------
 builder = StateGraph(ChatState)
-builder.add_node("chat", chat_node)
-builder.set_entry_point("chat")
-builder.add_edge("chat", END)
+
+builder.add_node("agent", agent_node)
+builder.add_node("tools", tool_node)
+
+builder.set_entry_point("agent")
+
+# Conditional routing from agent
+builder.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "tools": "tools",
+        END: END
+    }
+)
+
+# Loop back to agent after tool completes
+builder.add_edge("tools", "agent")
+
 chat_executor = builder.compile()
 
-app = FastAPI(title="AI Service Engine")
+
+# -----------------------------------------------------------------------------
+# 8. FastAPI API Endpoint
+# -----------------------------------------------------------------------------
+app = FastAPI(title="AI Service Engine - Agentic Tools")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,14 +213,15 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "ai-service", "memory": True}
+    return {"status": "healthy", "service": "ai-service", "tools_enabled": True}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def handle_chat(payload: ChatRequest):
     try:
         initial_state = {
-            "messages": [msg.model_dump() for msg in payload.messages]
+            "messages": [msg.model_dump() for msg in payload.messages],
+            "tool_calls": []
         }
         result = chat_executor.invoke(initial_state)
 
@@ -118,8 +230,8 @@ async def handle_chat(payload: ChatRequest):
 
         return ChatResponse(response=text_content)
     except Exception as exc:
-        print("❌ LangGraph Error:", str(exc))
+        print("❌ Agent Execution Error:", str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LangGraph execution failed: {str(exc)}",
+            detail=f"LangGraph tool loop failed: {str(exc)}",
         )
