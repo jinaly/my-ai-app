@@ -9,7 +9,7 @@ import traceback
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from google import genai
@@ -17,6 +17,7 @@ from google.genai import types
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+from app.rag_service import ingest_pdf_document, retrieve_relevant_context
 
 
 # -----------------------------------------------------------------------------
@@ -294,7 +295,6 @@ AVAILABLE_TOOLS = {
 # -------------------------------------------------------------------------------
 # 10. Streming Support
 # -------------------------------------------------------------------------------
-
 def stream_agent_generator(messages_payload: list):
     try:
         formatted_contents = []
@@ -317,9 +317,31 @@ def stream_agent_generator(messages_payload: list):
                 )
             )
 
+        # --- INSERT RAG CONTEXT RETRIEVAL HERE ---
+        last_message = messages_payload[-1] if messages_payload else {}
+        query_text = (
+            last_message.get("content", "")
+            if isinstance(last_message, dict)
+            else getattr(last_message, "content", str(last_message))
+        )
+
+        # Retrieve top semantic matches from ChromaDB
+        document_context = retrieve_relevant_context(query_text, top_k=3)
+
+        base_instructions = "You are a helpful assistant. Always call available tools when the user asks for real-time information such as weather."
+        if document_context:
+            system_instruction = (
+                f"{base_instructions} Use the following retrieved document context to answer questions accurately. "
+                f"If the answer is found in the context, cite facts directly from it.\n\n"
+                f"[DOCUMENT CONTEXT]:\n{document_context}"
+            )
+        else:
+            system_instruction = base_instructions
+        # ----------------------------------------
+
         # Configure system instructions and tools
         config = types.GenerateContentConfig(
-            system_instruction="You are a helpful assistant. Always call available tools when the user asks for real-time information such as weather.",
+            system_instruction=system_instruction,
             tools=list(AVAILABLE_TOOLS.values()),
             temperature=0.2,
         )
@@ -377,8 +399,6 @@ def stream_agent_generator(messages_payload: list):
     except Exception as exc:
         traceback.print_exc()
         yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
-
-
 # -----------------------------------------------------------------------------
 # 9. FastAPI API Endpoint
 # -----------------------------------------------------------------------------
@@ -443,3 +463,37 @@ def chat_stream_endpoint(payload: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+@app.post("/api/documents/upload")
+async def upload_pdf(
+    file: UploadFile = File(...), session_id: str = Form("default")
+):
+    file_bytes = await file.read()
+    result = ingest_pdf_document(
+        file_bytes, file.filename, session_id=session_id
+    )
+    return result
+
+@app.get("/api/documents")
+async def list_documents():
+    """Returns a list of unique uploaded document filenames stored in ChromaDB."""
+    from app.rag_service import collection
+
+    data = collection.get(include=["metadatas"])
+    metadatas = data.get("metadatas", [])
+    unique_files = list(
+        {m.get("source") for m in metadatas if m and "source" in m}
+    )
+    return {"documents": unique_files, "total_chunks": len(metadatas)}
+
+
+@app.delete("/api/sessions/{session_id}/cleanup")
+async def cleanup_session_vectors(session_id: str):
+    from app.rag_service import collection
+
+    # Deletes all vector embeddings associated with this chat
+    collection.delete(where={"session_id": session_id})
+    return {
+        "status": "success",
+        "message": f"Purged vectors for session {session_id}",
+    }

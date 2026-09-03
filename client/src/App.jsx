@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import ChatMessage from "./components/ChatMessage";
 import Sidebar from "./components/Sidebar";
+import ChatInputBar from "./components/ChatInputBar";
 
 const createNewSessionId = () =>
   "sess_" + Math.random().toString(36).substring(2, 9) + Date.now();
@@ -11,20 +12,17 @@ export default function App() {
   });
   const [sessions, setSessions] = useState([]);
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
   const abortControllerRef = useRef(null);
   const currentSessionRef = useRef(sessionId);
   const messagesEndRef = useRef(null);
 
-  // Sync ref with state
   useEffect(() => {
     currentSessionRef.current = sessionId;
     localStorage.setItem("ai_session_id", sessionId);
   }, [sessionId]);
 
-  // Fetch all sessions for the sidebar
   const fetchSessions = useCallback(async () => {
     try {
       const res = await fetch("http://localhost:5001/api/sessions");
@@ -37,7 +35,6 @@ export default function App() {
     }
   }, []);
 
-  // Fetch conversation messages when sessionId changes
   useEffect(() => {
     async function loadHistory() {
       try {
@@ -76,10 +73,8 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Switching sessions
   const handleSelectSession = (newId) => {
     if (newId === sessionId) return;
-
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -88,7 +83,6 @@ export default function App() {
     setSessionId(newId);
   };
 
-  // Creating a new session
   const handleNewChat = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -105,10 +99,9 @@ export default function App() {
     ]);
   };
 
-  // Deleting a session
   const handleDeleteSession = async (targetId) => {
     try {
-      await fetch(`http://localhost:5001/api/sessions/${targetId}`, {
+      await fetch(`http://localhost:8000/api/sessions/${targetId}/cleanup`, {
         method: "DELETE",
       });
       if (targetId === sessionId) {
@@ -121,23 +114,25 @@ export default function App() {
     }
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!input.trim() || loading) return;
+  const handleSendMessage = async ({ prompt, attachedFile }) => {
+    if (loading) return;
 
-    // Set up abort controller
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
     const targetSessionId = sessionId;
-    const userPrompt = input.trim();
+    const userDisplayContent = attachedFile
+      ? `📄 [Attached: ${attachedFile}]\n\n${
+          prompt || "Explain this document."
+        }`
+      : prompt;
+
     const updatedMessages = [
       ...messages,
-      { role: "user", content: userPrompt },
+      { role: "user", content: userDisplayContent },
     ];
 
     setMessages([...updatedMessages, { role: "assistant", content: "" }]);
-    setInput("");
     setLoading(true);
 
     try {
@@ -146,7 +141,8 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sessionId: targetSessionId,
-          prompt: userPrompt,
+          prompt: prompt || `Explain this document: ${attachedFile}`,
+          attachedFile: attachedFile || null,
         }),
         signal: controller.signal,
       });
@@ -179,8 +175,6 @@ export default function App() {
             const parsed = JSON.parse(dataStr);
             if (parsed.token) {
               streamedText += parsed.token;
-
-              // Only update UI if user hasn't navigated away to a different session
               if (currentSessionRef.current === targetSessionId) {
                 setMessages((prev) => {
                   const next = [...prev];
@@ -194,12 +188,10 @@ export default function App() {
             }
           } catch (err) {
             console.log(err);
-            // Ignore incomplete JSON buffers
           }
         }
       }
 
-      // Refresh sidebar titles after full response finishes
       fetchSessions();
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -237,7 +229,6 @@ export default function App() {
         onNewChat={handleNewChat}
         onDeleteSession={handleDeleteSession}
       />
-
       <main
         style={{
           flex: 1,
@@ -292,47 +283,12 @@ export default function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        <div
-          style={{
-            padding: "16px 24px",
-            maxWidth: "800px",
-            width: "100%",
-            margin: "0 auto",
-            boxSizing: "border-box",
-          }}
-        >
-          <form onSubmit={handleSubmit} style={{ display: "flex", gap: "8px" }}>
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask anything..."
-              style={{
-                flex: 1,
-                padding: "12px 16px",
-                borderRadius: "8px",
-                border: "1px solid #cbd5e1",
-                fontSize: "15px",
-                outline: "none",
-              }}
-            />
-            <button
-              type="submit"
-              disabled={loading}
-              style={{
-                padding: "12px 24px",
-                borderRadius: "8px",
-                border: "none",
-                backgroundColor: "#2563eb",
-                color: "#ffffff",
-                fontWeight: "600",
-                cursor: loading ? "not-allowed" : "pointer",
-              }}
-            >
-              {loading ? "..." : "Send"}
-            </button>
-          </form>
-        </div>
+        {/* Integrated ChatGPT / Gemini Style Input Bar */}
+        <ChatInputBar
+          onSendMessage={handleSendMessage}
+          loading={loading}
+          sessionId={sessionId}
+        />
       </main>
     </div>
   );
